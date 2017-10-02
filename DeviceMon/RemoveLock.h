@@ -10,6 +10,11 @@ public:
         return _acquired;
     }
 
+    IO_REMOVE_LOCK* Detach() {
+        _acquired = false;
+        return _lock;
+    }
+
     ~AutoRemoveLock() {
         if (_acquired) {
             IoReleaseRemoveLock(_lock, (PVOID)_tag);

@@ -8,6 +8,7 @@ void OnDriverUnload(PDRIVER_OBJECT DriverObject);
 NTSTATUS OnDeviceCreateClose(PDEVICE_OBJECT, PIRP);
 NTSTATUS OnDeviceIoControl(PDEVICE_OBJECT, PIRP);
 NTSTATUS OnGenericDispatch(PDEVICE_OBJECT, PIRP);
+NTSTATUS OnPnpDispatch(PDEVICE_OBJECT, PIRP);
 
 Globals globals;
 
@@ -26,6 +27,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING /* RegistryPat
     // specifics 
     DriverObject->MajorFunction[IRP_MJ_CREATE] = DriverObject->MajorFunction[IRP_MJ_CLOSE] = OnDeviceCreateClose;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = OnDeviceIoControl;
+    DriverObject->MajorFunction[IRP_MJ_PNP] = OnPnpDispatch;
 
     UNICODE_STRING name, symLink;
     RtlInitUnicodeString(&name, DeviceName);
@@ -123,12 +125,12 @@ NTSTATUS StartMonitoring() {
 }
 
 NTSTATUS OnDeviceIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    if (globals.MainDeviceObject != DeviceObject)
+        return OnGenericDispatch(DeviceObject, Irp);
+
     AutoRemoveLock lock(&globals.RemoveLock);
     if (!lock)
         return CompleteIrp(Irp, STATUS_DELETE_PENDING);
-
-    if (globals.MainDeviceObject != DeviceObject)
-        return OnGenericDispatch(DeviceObject, Irp);
 
     NTSTATUS status = STATUS_SUCCESS;
     ULONG_PTR information = 0;
@@ -163,13 +165,18 @@ NTSTATUS OnDeviceIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                 KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, DRIVER_PREFIX "Error creating device object (0x%08X)\n", status));
                 break;
             }
+
             auto ext = static_cast<GenericDeviceData*>(sourceDevice->DeviceExtension);
             ext->TargetDevice = IoAttachDeviceToDeviceStack(sourceDevice, deviceObject);
             if (!ext->TargetDevice) {
                 KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, DRIVER_PREFIX "Error attaching devices\n"));
                 status = STATUS_UNSUCCESSFUL;
+                IoDeleteDevice(sourceDevice);
                 break;
             }
+
+            sourceDevice->Flags |= ext->TargetDevice->Flags & (DO_DIRECT_IO | DO_BUFFERED_IO | DO_POWER_PAGABLE);
+            sourceDevice->Flags &= ~DO_DEVICE_INITIALIZING;
 
             ext->DeviceObject = sourceDevice;
             *(PVOID*)Irp->AssociatedIrp.SystemBuffer = ext->TargetDevice;
@@ -262,12 +269,14 @@ NTSTATUS OnGenericDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         return CompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST);
 
     AutoRemoveLock lock(&globals.RemoveLock);
+    if (!lock)
+        return CompleteIrp(Irp, STATUS_DELETE_PENDING);
 
     auto context = static_cast<GenericDeviceData*>(DeviceObject->DeviceExtension);
 
-    if (!lock || !globals.IsMonitoring || globals.Event == nullptr) {
+    if (!globals.IsMonitoring || globals.Event == nullptr) {
         //
-        // not monitoring or unloading - just send IRP down the devnode
+        // not monitoring - just send IRP down the devnode
         //
         IoSkipCurrentIrpStackLocation(Irp);
         return IoCallDriver(context->TargetDevice, Irp);
@@ -312,10 +321,32 @@ NTSTATUS OnGenericDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     }
 
     globals.DataBuffer->Write(&info, info.Size);
-    KeSetEvent(globals.Event, 3, FALSE);
+    KeSetEvent(globals.Event, 1, FALSE);
 
-    IoCopyCurrentIrpStackLocationToNext(Irp);
-    IoSetCompletionRoutineEx(DeviceObject, Irp, OnIrpComplete, nullptr, TRUE, TRUE, TRUE);
+//    IoCopyCurrentIrpStackLocationToNext(Irp);
+//    IoSetCompletionRoutineEx(DeviceObject, Irp, OnIrpComplete, nullptr, TRUE, TRUE, TRUE);
+    IoSkipCurrentIrpStackLocation(Irp);
 
     return IoCallDriver(context->TargetDevice, Irp);
+}
+
+NTSTATUS OnPnpDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    AutoRemoveLock lock(&globals.RemoveLock);
+    if (!lock)
+        return CompleteIrp(Irp, STATUS_DELETE_PENDING);
+
+    auto stack = IoGetCurrentIrpStackLocation(Irp);
+    auto minor = stack->MinorFunction;
+    auto context = static_cast<GenericDeviceData*>(DeviceObject->DeviceExtension);
+
+    IoSkipCurrentIrpStackLocation(Irp);
+    auto status = IoCallDriver(context->TargetDevice, Irp);
+
+    if (minor == IRP_MN_REMOVE_DEVICE) {
+        auto removeLock = lock.Detach();
+        IoReleaseRemoveLockAndWait(removeLock, nullptr);
+        IoDetachDevice(context->TargetDevice);
+        IoDeleteDevice(DeviceObject);
+    }
+    return status;
 }
