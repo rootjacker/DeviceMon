@@ -20,12 +20,12 @@ const ULONG DRIVER_TAG = 'NMVD';
 struct GenericDeviceData {
     PDEVICE_OBJECT TargetDevice;
     PDEVICE_OBJECT DeviceObject;
+    IO_REMOVE_LOCK RemoveLock;
     WCHAR DeviceName[DeviceNameLength];
 };
 
 struct Globals {
     PDEVICE_OBJECT MainDeviceObject;
-    IO_REMOVE_LOCK RemoveLock;
     CyclicBuffer* DataBuffer;
     PKEVENT Event;
     bool IsMonitoring;

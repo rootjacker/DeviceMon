@@ -9,6 +9,7 @@ NTSTATUS OnDeviceCreateClose(PDEVICE_OBJECT, PIRP);
 NTSTATUS OnDeviceIoControl(PDEVICE_OBJECT, PIRP);
 NTSTATUS OnGenericDispatch(PDEVICE_OBJECT, PIRP);
 NTSTATUS OnPnpDispatch(PDEVICE_OBJECT, PIRP);
+NTSTATUS OnPowerDispatch(PDEVICE_OBJECT, PIRP);
 
 Globals globals;
 
@@ -28,6 +29,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING /* RegistryPat
     DriverObject->MajorFunction[IRP_MJ_CREATE] = DriverObject->MajorFunction[IRP_MJ_CLOSE] = OnDeviceCreateClose;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = OnDeviceIoControl;
     DriverObject->MajorFunction[IRP_MJ_PNP] = OnPnpDispatch;
+    DriverObject->MajorFunction[IRP_MJ_POWER] = OnPowerDispatch;
 
     UNICODE_STRING name, symLink;
     RtlInitUnicodeString(&name, DeviceName);
@@ -54,8 +56,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING /* RegistryPat
 
     KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, DRIVER_PREFIX "DriverEntry completed successfully\n"));
 
-    IoInitializeRemoveLock(&globals.RemoveLock, DRIVER_TAG, 10, 0);
-
     return status;
 }
 
@@ -67,9 +67,6 @@ NTSTATUS CompleteIrp(PIRP Irp, NTSTATUS status = STATUS_SUCCESS, ULONG_PTR infor
 }
 
 void OnDriverUnload(PDRIVER_OBJECT DriverObject) {
-    IoAcquireRemoveLock(&globals.RemoveLock, (PVOID)DRIVER_TAG);
-    IoReleaseRemoveLockAndWait(&globals.RemoveLock, (PVOID)DRIVER_TAG);
-
     globals.IsMonitoring = false;
     if (globals.DataBuffer)
         delete globals.DataBuffer;
@@ -128,10 +125,6 @@ NTSTATUS OnDeviceIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     if (globals.MainDeviceObject != DeviceObject)
         return OnGenericDispatch(DeviceObject, Irp);
 
-    AutoRemoveLock lock(&globals.RemoveLock);
-    if (!lock)
-        return CompleteIrp(Irp, STATUS_DELETE_PENDING);
-
     NTSTATUS status = STATUS_SUCCESS;
     ULONG_PTR information = 0;
 
@@ -153,10 +146,12 @@ NTSTATUS OnDeviceIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             RtlInitUnicodeString(&udeviceName, deviceName);
             PFILE_OBJECT fileObject;
             PDEVICE_OBJECT deviceObject;
-            status = IoGetDeviceObjectPointer(&udeviceName, FILE_READ_ACCESS, &fileObject, &deviceObject);
+            status = IoGetDeviceObjectPointer(&udeviceName, FILE_ALL_ACCESS, &fileObject, &deviceObject);
             if (!NT_SUCCESS(status)) {
                 break;
             }
+            ObDereferenceObject(fileObject);
+
             auto context = new (NonPagedPool) GenericDeviceData;
             ::wcscpy_s(context->DeviceName, deviceName);
             PDEVICE_OBJECT sourceDevice;
@@ -175,7 +170,10 @@ NTSTATUS OnDeviceIoControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
                 break;
             }
 
-            sourceDevice->Flags |= ext->TargetDevice->Flags & (DO_DIRECT_IO | DO_BUFFERED_IO | DO_POWER_PAGABLE);
+            IoInitializeRemoveLock(&ext->RemoveLock, DRIVER_TAG, 10, 0);
+
+            sourceDevice->Flags |= ext->TargetDevice->Flags & (DO_DIRECT_IO | DO_BUFFERED_IO);
+            sourceDevice->Flags |= DO_POWER_PAGABLE;
             sourceDevice->Flags &= ~DO_DEVICE_INITIALIZING;
 
             ext->DeviceObject = sourceDevice;
@@ -268,11 +266,11 @@ NTSTATUS OnGenericDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     if (DeviceObject == globals.MainDeviceObject)
         return CompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST);
 
-    AutoRemoveLock lock(&globals.RemoveLock);
+    auto context = static_cast<GenericDeviceData*>(DeviceObject->DeviceExtension);
+
+    AutoRemoveLock lock(&context->RemoveLock);
     if (!lock)
         return CompleteIrp(Irp, STATUS_DELETE_PENDING);
-
-    auto context = static_cast<GenericDeviceData*>(DeviceObject->DeviceExtension);
 
     if (!globals.IsMonitoring || globals.Event == nullptr) {
         //
@@ -318,6 +316,7 @@ NTSTATUS OnGenericDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             info.Read.Length = parameters.Write.Length;
             info.Read.Offset = parameters.Write.ByteOffset.QuadPart;
             break;
+
     }
 
     globals.DataBuffer->Write(&info, info.Size);
@@ -331,13 +330,14 @@ NTSTATUS OnGenericDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
 }
 
 NTSTATUS OnPnpDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
-    AutoRemoveLock lock(&globals.RemoveLock);
+    auto context = static_cast<GenericDeviceData*>(DeviceObject->DeviceExtension);
+
+    AutoRemoveLock lock(&context->RemoveLock);
     if (!lock)
         return CompleteIrp(Irp, STATUS_DELETE_PENDING);
 
     auto stack = IoGetCurrentIrpStackLocation(Irp);
     auto minor = stack->MinorFunction;
-    auto context = static_cast<GenericDeviceData*>(DeviceObject->DeviceExtension);
 
     IoSkipCurrentIrpStackLocation(Irp);
     auto status = IoCallDriver(context->TargetDevice, Irp);
@@ -350,3 +350,11 @@ NTSTATUS OnPnpDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     }
     return status;
 }
+
+NTSTATUS OnPowerDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    PoStartNextPowerIrp(Irp);
+    auto ext = static_cast<GenericDeviceData*>(DeviceObject->DeviceExtension);
+    IoSkipCurrentIrpStackLocation(Irp);
+    return PoCallDriver(ext->TargetDevice, Irp);
+}
+

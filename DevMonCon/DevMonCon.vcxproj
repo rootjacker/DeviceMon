@@ -23,7 +23,7 @@
     <ProjectGuid>{B8AAD322-EDFB-480C-9C41-4CCAD41B71AD}</ProjectGuid>
     <Keyword>Win32Proj</Keyword>
     <RootNamespace>DevMonCon</RootNamespace>
-    <WindowsTargetPlatformVersion>10.0.16278.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion>10.0.15063.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
